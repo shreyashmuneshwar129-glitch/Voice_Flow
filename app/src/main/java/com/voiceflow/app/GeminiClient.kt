@@ -9,9 +9,9 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
-import java.net.SocketTimeoutException
 
 object GeminiClient {
 
@@ -25,34 +25,26 @@ object GeminiClient {
     data class DictationResult(
         val success: Boolean,
         val text: String = "",
+        val usedModel: String = "",
         val errorMessage: String = ""
     )
 
     private const val SYSTEM_PROMPT = """
-You are VoiceFlow, an AI voice-dictation engine inspired by Wispr Flow and Google Gboard Rambler.
-Your job is to transcribe the user's spoken audio AND clean it up in a single pass.
+You are VoiceFlow, a fast AI voice-dictation engine inspired by Wispr Flow and Google Gboard Rambler.
+Transcribe the user's spoken audio AND clean it up in a single pass.
 
-FOLLOW THESE STRICT RULES:
-1. OUTPUT ONLY THE FINAL CLEANED DICTATED TEXT. Never add explanations, greetings, quotes, labels, or markdown blocks around the answer. If the audio is completely silent or just background noise with no speech, return an empty string.
-2. CLEANUP & FLUENCY:
-   - Remove filler words ("um", "uh", "erm", "like", "you know", "matlab", "accha", "haan toh" when used purely as filler) and accidental word stutters/repeats.
-   - Fix grammar, punctuation, and capitalization naturally so the message reads cleanly.
-3. SELF-CORRECTIONS:
-   - When the speaker corrects themselves mid-sentence (e.g., "send it at 5, no 6", "meet on Tuesday sorry Wednesday", "tell Rahul wait no Aman"), keep ONLY the final intended version ("Send it at 6.", "Meet on Wednesday.", "Tell Aman.").
-4. LANGUAGES & SCRIPTS (CRITICAL):
-   - The user speaks English, Hinglish (Hindi + English), and Marathi, and may switch languages mid-sentence.
-   - Keep the exact language(s) spoken. NEVER translate into another language unless the speaker explicitly says "translate".
-   - English stays in English.
-   - Hinglish MUST stay in Roman script (English alphabet, e.g., "kal milte hain शाम को" -> "Kal milte hain shaam ko").
-   - Marathi MUST ALWAYS be written in Roman script (English letters, e.g., "Tu kasa aahes?", "Mi udyach yeto", "Jevan zhala ka?"). NEVER output Devanagari script for Marathi or Hindi.
-5. SPOKEN EMOJIS:
-   - When the speaker names an emoji inside a sentence, replace the spoken emoji phrase with the actual emoji character (e.g., "how are you smiling emoji" -> "How are you 😊", "congrats party emoji fire emoji" -> "Congrats 🎉🔥", "thumbs up emoji" -> "👍", "laughing emoji" -> "😂", "red heart emoji" -> "❤️", "folded hands emoji" -> "🙏").
+STRICT RULES:
+1. OUTPUT ONLY THE FINAL CLEANED DICTATED TEXT. Never add explanations, greetings, quotes, or markdown. If the audio has no speech, return an empty string.
+2. CLEANUP: Remove filler words ("um", "uh", "like", "you know", "matlab", "accha") and stutters/repeats. Fix grammar, punctuation, and capitalization naturally.
+3. SELF-CORRECTIONS: When the speaker corrects themselves mid-sentence ("send it at 5, no 6", "meet Tuesday sorry Wednesday"), output ONLY the final intended version ("Send it at 6.", "Meet Wednesday.").
+4. LANGUAGES & SCRIPTS:
+   - The user speaks English, Hinglish, and Marathi, and may switch mid-sentence.
+   - NEVER translate unless the user explicitly says "translate".
+   - Hinglish MUST stay in Roman script (English letters).
+   - Marathi MUST ALWAYS be written in Roman script (English letters, e.g., "Tu kasa aahes?"). NEVER use Devanagari script.
+5. SPOKEN EMOJIS: Replace spoken emoji names with the emoji character ("how are you smiling emoji" -> "How are you 😊", "thumbs up emoji" -> "👍", "laughing emoji" -> "😂", "red heart emoji" -> "❤️", "fire emoji" -> "🔥", "party emoji" -> "🎉", "folded hands emoji" -> "🙏").
 """
 
-    /**
-     * Calls ListModels using the user's API key, filters for free Flash-capable models that
-     * support generateContent and audio input, and automatically picks the best Flash model.
-     */
     suspend fun fetchAndPickBestModel(apiKey: String): ModelDiscoveryResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isEmpty()) {
@@ -69,8 +61,8 @@ FOLLOW THESE STRICT RULES:
             val url = URL(urlString)
             connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 15000
-                readTimeout = 15000
+                connectTimeout = 12000
+                readTimeout = 12000
             }
 
             val status = connection.responseCode
@@ -104,8 +96,6 @@ FOLLOW THESE STRICT RULES:
                 if (!supportsGenerate) continue
 
                 val lower = shortName.lowercase()
-                // Only keep Gemini models capable of multimodal audio input + text output,
-                // and exclude paid-only/pro/ultra/tts/image/embedding/vision-only variants.
                 val isGemini = lower.startsWith("gemini")
                 val excluded = lower.contains("pro") ||
                         lower.contains("ultra") ||
@@ -117,7 +107,8 @@ FOLLOW THESE STRICT RULES:
                         lower.contains("robotics") ||
                         lower.contains("computer-use") ||
                         lower.contains("aqa") ||
-                        lower.contains("thinking")
+                        lower.contains("thinking") ||
+                        lower.contains("live")
 
                 if (isGemini && !excluded) {
                     candidateModels.add(shortName)
@@ -127,7 +118,7 @@ FOLLOW THESE STRICT RULES:
             if (candidateModels.isEmpty()) {
                 return@withContext ModelDiscoveryResult(
                     success = false,
-                    errorMessage = "No compatible free Flash models found for this API key. Make sure your key is from Google AI Studio (aistudio.google.com)."
+                    errorMessage = "No compatible free Flash models found for this API key."
                 )
             }
 
@@ -142,12 +133,12 @@ FOLLOW THESE STRICT RULES:
         } catch (e: UnknownHostException) {
             ModelDiscoveryResult(
                 success = false,
-                errorMessage = "No internet connection. Tip: Turn on Wi-Fi or Mobile Data and try again."
+                errorMessage = "No internet connection. Turn on Wi-Fi or Mobile Data."
             )
         } catch (e: SocketTimeoutException) {
             ModelDiscoveryResult(
                 success = false,
-                errorMessage = "Connection timed out. Tip: Check your internet signal and tap Verify again."
+                errorMessage = "Connection timed out. Check your internet signal and try again."
             )
         } catch (e: Exception) {
             ModelDiscoveryResult(
@@ -159,28 +150,38 @@ FOLLOW THESE STRICT RULES:
         }
     }
 
-    private fun rankModel(modelName: String): Int {
-        val m = modelName.lowercase()
+    /**
+     * Ranks Gemini 3.x Flash models (like gemini-3.8-flash, gemini-3.6-flash, gemini-3-flash-preview)
+     * at the very top, and pushes legacy 2.5 / 2.0 / 1.5 models to the bottom because Google
+     * blocks 2.5/2.0 for new API keys.
+     */
+    fun rankModel(modelName: String): Int {
+        val m = modelName.lowercase().removePrefix("models/")
+        if (m.startsWith("gemini-1.") || m.startsWith("gemini-2.0") || m.startsWith("gemini-2.5")) {
+            return 500
+        }
         return when {
-            m == "gemini-2.5-flash" -> 1
-            m == "gemini-2.0-flash" -> 2
-            m == "gemini-1.5-flash" -> 3
-            m.startsWith("gemini-2.5-flash") && !m.contains("lite") && !m.contains("preview") -> 4
-            m.startsWith("gemini-2.5-flash") && !m.contains("lite") -> 5
-            m.startsWith("gemini-2.0-flash") && !m.contains("lite") && !m.contains("exp") -> 6
-            m.startsWith("gemini-1.5-flash") && !m.contains("8b") -> 7
-            m.contains("flash") && !m.contains("lite") -> 8
-            m.contains("flash") -> 9
-            else -> 20
+            m == "gemini-3.8-flash" -> 1
+            m == "gemini-3.6-flash" -> 2
+            m == "gemini-3.5-flash" -> 3
+            m == "gemini-3-flash-preview" -> 4
+            m == "gemini-3-flash" -> 5
+            m == "gemini-flash-latest" -> 6
+            m.startsWith("gemini-3.") && m.contains("flash") && !m.contains("lite") && !m.contains("preview") -> 7
+            m.startsWith("gemini-3") && m.contains("flash") && !m.contains("lite") -> 8
+            m == "gemini-3.5-flash-lite" -> 9
+            m == "gemini-3.1-flash-lite" -> 10
+            m.startsWith("gemini-3") && m.contains("flash") -> 11
+            m.contains("flash") && !m.contains("lite") -> 20
+            m.contains("flash") -> 30
+            else -> 100
         }
     }
 
-    /**
-     * Sends WAV audio bytes to Gemini in one call to transcribe and clean.
-     */
     suspend fun transcribeAndClean(
         apiKey: String,
         modelName: String,
+        availableModels: List<String>,
         wavBytes: ByteArray
     ): DictationResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
@@ -191,15 +192,111 @@ FOLLOW THESE STRICT RULES:
             )
         }
 
-        val activeModel = modelName.trim().removePrefix("models/")
-        if (activeModel.isEmpty()) {
-            return@withContext DictationResult(
-                success = false,
-                errorMessage = "No model selected. Open VoiceFlow app and tap 'Verify & Save Key' to auto-pick a model."
+        val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+
+        // Build ordered queue of models to try so if one returns 404/429, we auto-heal immediately
+        val modelsToTry = LinkedHashSet<String>()
+        val initial = modelName.trim().removePrefix("models/")
+        if (initial.isNotBlank() && !initial.startsWith("gemini-2.5") && !initial.startsWith("gemini-2.0")) {
+            modelsToTry.add(initial)
+        }
+        availableModels.sortedBy { rankModel(it) }.forEach {
+            val clean = it.trim().removePrefix("models/")
+            if (clean.isNotBlank()) modelsToTry.add(clean)
+        }
+        // Standard current fallback Flash models for new users
+        modelsToTry.add("gemini-3.8-flash")
+        modelsToTry.add("gemini-3.6-flash")
+        modelsToTry.add("gemini-3-flash-preview")
+        modelsToTry.add("gemini-3.1-flash-lite")
+        if (initial.isNotBlank()) modelsToTry.add(initial)
+
+        val queue = ArrayDeque(modelsToTry)
+        val tried = mutableSetOf<String>()
+        var lastError = "Failed to reach Gemini API."
+
+        while (queue.isNotEmpty() && tried.size < 4) {
+            val candidate = queue.removeFirst()
+            if (!tried.add(candidate)) continue
+
+            val attempt = callGenerateContentSingle(
+                apiKey = cleanKey,
+                model = candidate,
+                base64Audio = base64Audio,
+                useLowThinking = true
             )
+
+            if (attempt.httpStatus in 200..299) {
+                return@withContext DictationResult(
+                    success = true,
+                    text = attempt.text,
+                    usedModel = candidate
+                )
+            }
+
+            // If a model rejected thinkingConfig with HTTP 400, retry once without thinkingConfig
+            if (attempt.httpStatus == 400 && attempt.rawError.contains("thinking", ignoreCase = true)) {
+                val retryNoThinking = callGenerateContentSingle(
+                    apiKey = cleanKey,
+                    model = candidate,
+                    base64Audio = base64Audio,
+                    useLowThinking = false
+                )
+                if (retryNoThinking.httpStatus in 200..299) {
+                    return@withContext DictationResult(
+                        success = true,
+                        text = retryNoThinking.text,
+                        usedModel = candidate
+                    )
+                }
+            }
+
+            lastError = formatApiError(attempt.httpStatus, attempt.rawError)
+
+            // If 404 says "Please update your code to use models/gemini-3.8-flash", extract that exact model and try it next!
+            if (attempt.httpStatus == 404 || attempt.httpStatus == 429 || attempt.httpStatus == 503) {
+                val suggested = extractSuggestedModel(attempt.rawError, candidate)
+                if (suggested != null && suggested !in tried) {
+                    queue.addFirst(suggested)
+                }
+                continue
+            } else {
+                // For auth (401/403) or network errors, stop immediately
+                break
+            }
         }
 
-        val base64Audio = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+        DictationResult(
+            success = false,
+            errorMessage = lastError
+        )
+    }
+
+    private data class SingleCallOutput(
+        val httpStatus: Int,
+        val text: String = "",
+        val rawError: String = ""
+    )
+
+    private fun callGenerateContentSingle(
+        apiKey: String,
+        model: String,
+        base64Audio: String,
+        useLowThinking: Boolean
+    ): SingleCallOutput {
+        val genConfig = JSONObject()
+            .put("temperature", 0.1)
+            .put("maxOutputTokens", 4096)
+
+        if (useLowThinking) {
+            val lower = model.lowercase()
+            if (lower.startsWith("gemini-3") || lower.startsWith("gemini-4")) {
+                // Critical speed fix for Gemini 3+: set thinkingLevel to "low" so it responds in ~1s
+                genConfig.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
+            } else if (lower.startsWith("gemini-2.5") && !lower.contains("lite")) {
+                genConfig.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+            }
+        }
 
         val requestJson = JSONObject().apply {
             put(
@@ -226,32 +323,27 @@ FOLLOW THESE STRICT RULES:
                             .put(
                                 JSONObject().put(
                                     "text",
-                                    "Transcribe and clean this spoken dictation following all system rules. Output only the final text."
+                                    "Transcribe and clean this audio. Output ONLY the final cleaned text."
                                 )
                             )
                     )
                 )
             )
-            put(
-                "generationConfig",
-                JSONObject()
-                    .put("temperature", 0.15)
-                    .put("maxOutputTokens", 1024)
-            )
+            put("generationConfig", genConfig)
         }
 
         val urlString =
-            "https://generativelanguage.googleapis.com/v1beta/models/$activeModel:generateContent?key=$cleanKey"
+            "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
         var connection: HttpURLConnection? = null
 
-        try {
+        return try {
             val url = URL(urlString)
             connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                 doOutput = true
-                connectTimeout = 20000
-                readTimeout = 35000
+                connectTimeout = 15000
+                readTimeout = 25000
             }
 
             OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
@@ -263,19 +355,13 @@ FOLLOW THESE STRICT RULES:
             val responseBody = readStream(connection, status)
 
             if (status !in 200..299) {
-                return@withContext DictationResult(
-                    success = false,
-                    errorMessage = formatApiError(status, responseBody)
-                )
+                return SingleCallOutput(httpStatus = status, rawError = responseBody)
             }
 
             val root = JSONObject(responseBody)
             val candidates = root.optJSONArray("candidates")
             if (candidates == null || candidates.length() == 0) {
-                return@withContext DictationResult(
-                    success = true,
-                    text = ""
-                )
+                return SingleCallOutput(httpStatus = 200, text = "")
             }
 
             val firstCandidate = candidates.optJSONObject(0)
@@ -284,34 +370,46 @@ FOLLOW THESE STRICT RULES:
             val sb = StringBuilder()
             if (parts != null) {
                 for (i in 0 until parts.length()) {
-                    val partText = parts.optJSONObject(i)?.optString("text", "") ?: ""
-                    sb.append(partText)
+                    val partObj = parts.optJSONObject(i) ?: continue
+                    // Skip internal thinking parts so only real dictated text is inserted
+                    if (partObj.optBoolean("thought", false)) continue
+                    sb.append(partObj.optString("text", ""))
                 }
             }
 
-            val cleanedText = sb.toString().trim()
-            DictationResult(
-                success = true,
-                text = cleanedText
+            SingleCallOutput(
+                httpStatus = 200,
+                text = sb.toString().trim()
             )
         } catch (e: UnknownHostException) {
-            DictationResult(
-                success = false,
-                errorMessage = "No internet connection. Tip: Check Wi-Fi/Data."
+            SingleCallOutput(
+                httpStatus = -1,
+                rawError = "No internet connection. Tip: Check Wi-Fi or Mobile Data."
             )
         } catch (e: SocketTimeoutException) {
-            DictationResult(
-                success = false,
-                errorMessage = "Request timed out. Tip: Try speaking a shorter clip or check signal."
+            SingleCallOutput(
+                httpStatus = -2,
+                rawError = "Request timed out. Tip: Check signal or try a shorter voice clip."
             )
         } catch (e: Exception) {
-            DictationResult(
-                success = false,
-                errorMessage = "Error: ${e.localizedMessage ?: "Failed to reach Gemini"}"
+            SingleCallOutput(
+                httpStatus = -3,
+                rawError = e.localizedMessage ?: "Network error"
             )
         } finally {
             connection?.disconnect()
         }
+    }
+
+    private fun extractSuggestedModel(rawError: String, failedModel: String): String? {
+        val regex = Regex("models/(gemini-[a-zA-Z0-9._-]+)")
+        for (match in regex.findAll(rawError)) {
+            val found = match.groupValues[1].trim().trimEnd('.', ',', ')')
+            if (found.isNotBlank() && !found.equals(failedModel, ignoreCase = true)) {
+                return found
+            }
+        }
+        return null
     }
 
     private fun readStream(connection: HttpURLConnection, status: Int): String {
@@ -321,6 +419,8 @@ FOLLOW THESE STRICT RULES:
     }
 
     private fun formatApiError(status: Int, rawBody: String): String {
+        if (status < 0) return rawBody
+
         var googleMessage = "Unknown API error"
         try {
             val errObj = JSONObject(rawBody).optJSONObject("error")
@@ -336,12 +436,12 @@ FOLLOW THESE STRICT RULES:
         }
 
         val fixTip = when (status) {
-            400 -> "Tip: Check that your API key is copied completely with no spaces."
+            400 -> "Tip: Check your API key or switch models in VoiceFlow Settings."
             401, 403 -> "Tip: Your API key was rejected. Create a fresh free key in Google AI Studio."
-            404 -> "Tip: This model changed. Open VoiceFlow Settings and tap 'Refresh Models'."
-            429 -> "Tip: Free rate limit reached. Wait 20–30 seconds or switch to another Flash model in Settings."
-            500, 503 -> "Tip: Google's server is busy right now. Try again in a few seconds."
-            else -> "Tip: Check your internet connection or refresh your model in VoiceFlow Settings."
+            404 -> "Tip: Open VoiceFlow Settings and pick gemini-3.8-flash in Change Model."
+            429 -> "Tip: Free rate limit reached. Wait 15 seconds and try again."
+            500, 503 -> "Tip: Google's server is busy right now. Try again in a moment."
+            else -> "Tip: Check your internet connection."
         }
 
         return "HTTP $status: $googleMessage\n$fixTip"
