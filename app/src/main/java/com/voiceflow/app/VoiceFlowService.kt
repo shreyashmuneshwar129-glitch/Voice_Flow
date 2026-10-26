@@ -46,6 +46,12 @@ class VoiceFlowService : AccessibilityService() {
     private var lastFocusedEditableNode: AccessibilityNodeInfo? = null
     private var recordingTargetNode: AccessibilityNodeInfo? = null
 
+    // Snapshot of the text field & selection captured when the user taps the bubble
+    private var capturedFullText: String = ""
+    private var capturedSelectedText: String = ""
+    private var capturedSelStart: Int = -1
+    private var capturedSelEnd: Int = -1
+
     // Snapshot for the 3-second Undo chip
     private var undoNode: AccessibilityNodeInfo? = null
     private var undoPreviousText: String? = null
@@ -72,7 +78,6 @@ class VoiceFlowService : AccessibilityService() {
         prefs = PrefsManager(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        // Auto-upgrade if old restricted 2.5/2.0 model was saved earlier
         if (prefs.selectedModel.startsWith("gemini-2.")) {
             val better = prefs.availableModels
                 .sortedBy { GeminiClient.rankModel(it) }
@@ -91,7 +96,11 @@ class VoiceFlowService : AccessibilityService() {
             onResult = { offlineText ->
                 bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
                 if (offlineText.isNotBlank()) {
-                    insertCleanedText(offlineText, wasOffline = true)
+                    insertCleanedText(
+                        cleanText = offlineText,
+                        wasOffline = true,
+                        replaceEntireField = false
+                    )
                 }
             },
             onError = { errorMsg ->
@@ -273,7 +282,6 @@ class VoiceFlowService : AccessibilityService() {
     }
 
     private fun handleBubbleTap() {
-        // Prevent accidental double-taps within 350ms
         val now = SystemClock.elapsedRealtime()
         if (now - lastTapTimestamp < 350L) return
         lastTapTimestamp = now
@@ -292,8 +300,10 @@ class VoiceFlowService : AccessibilityService() {
         mainHandler.removeCallbacks(hideChipRunnable)
         bubbleOverlay?.hideChip()
 
-        // Lock onto the current text field right when recording starts
-        recordingTargetNode = resolveActiveEditableNode()
+        // Lock onto the current text field and capture any highlighted selection right now!
+        val node = resolveActiveEditableNode()
+        recordingTargetNode = node
+        captureNodeSelectionSnapshot(node)
 
         val hasMicPerm = ContextCompat.checkSelfPermission(
             this,
@@ -328,6 +338,34 @@ class VoiceFlowService : AccessibilityService() {
         bubbleOverlay?.setState(BubbleOverlayView.State.LISTENING)
     }
 
+    private fun captureNodeSelectionSnapshot(node: AccessibilityNodeInfo?) {
+        capturedFullText = ""
+        capturedSelectedText = ""
+        capturedSelStart = -1
+        capturedSelEnd = -1
+
+        if (node == null) return
+        try {
+            node.refresh()
+            val isHint = node.isShowingHintText
+            val text = if (isHint) "" else (node.text?.toString() ?: "")
+            capturedFullText = text
+
+            val rawStart = node.textSelectionStart
+            val rawEnd = node.textSelectionEnd
+            if (!isHint && rawStart >= 0 && rawEnd >= 0 && rawStart <= text.length && rawEnd <= text.length) {
+                val s = minOf(rawStart, rawEnd)
+                val e = maxOf(rawStart, rawEnd)
+                capturedSelStart = s
+                capturedSelEnd = e
+                if (e > s) {
+                    capturedSelectedText = text.substring(s, e)
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun stopAndProcessDictation() {
         if (isUsingOfflineMode) {
             bubbleOverlay?.setState(BubbleOverlayView.State.PROCESSING)
@@ -338,32 +376,42 @@ class VoiceFlowService : AccessibilityService() {
         bubbleOverlay?.setState(BubbleOverlayView.State.PROCESSING)
         val wavBytes = audioRecorder?.stopAndGetWavBytes() ?: ByteArray(0)
 
-        // Require at least ~0.2s of audio so accidental quick taps don't send empty audio
-        if (wavBytes.size < 6400) {
+        if (wavBytes.size < 11244) {
             bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
-            showTemporaryChip("Hold a moment longer while speaking.", isError = false, durationMs = 2200L)
             return
         }
+
+        // Also check if the user finished highlighting text while speaking
+        val activeNode = resolveActiveEditableNode() ?: recordingTargetNode
+        if (capturedSelectedText.isBlank() && activeNode != null) {
+            captureNodeSelectionSnapshot(activeNode)
+        }
+
+        val selectedSnapshot = capturedSelectedText
+        val fullTextSnapshot = capturedFullText
 
         serviceScope.launch {
             val result = GeminiClient.transcribeAndClean(
                 apiKey = prefs.apiKey,
                 modelName = prefs.selectedModel,
                 availableModels = prefs.availableModels,
-                wavBytes = wavBytes
+                wavBytes = wavBytes,
+                selectedText = selectedSnapshot,
+                existingFieldText = fullTextSnapshot
             )
 
             bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
 
             if (result.success) {
-                // Save the working model so future requests go straight to it on the first try
                 if (result.usedModel.isNotBlank() && result.usedModel != prefs.selectedModel) {
                     prefs.selectedModel = result.usedModel
                 }
                 if (result.text.isNotBlank()) {
-                    insertCleanedText(result.text, wasOffline = false)
-                } else {
-                    showTemporaryChip("Didn't catch any speech. Try speaking closer to the mic.", isError = false, durationMs = 2800L)
+                    insertCleanedText(
+                        cleanText = result.text,
+                        wasOffline = false,
+                        replaceEntireField = result.replaceEntireField
+                    )
                 }
             } else {
                 showTemporaryChip(result.errorMessage, isError = true, durationMs = 6500L)
@@ -382,7 +430,11 @@ class VoiceFlowService : AccessibilityService() {
         }
     }
 
-    private fun insertCleanedText(cleanText: String, wasOffline: Boolean) {
+    private fun insertCleanedText(
+        cleanText: String,
+        wasOffline: Boolean,
+        replaceEntireField: Boolean
+    ) {
         val targetNode = resolveActiveEditableNode() ?: recordingTargetNode
         if (targetNode == null) {
             showTemporaryChip("Tap inside a text box first.", isError = true, durationMs = 3500L)
@@ -397,22 +449,56 @@ class VoiceFlowService : AccessibilityService() {
         val isHint = targetNode.isShowingHintText
         val existingText = if (isHint) "" else (targetNode.text?.toString() ?: "")
 
-        val selStart = targetNode.textSelectionStart
-        val selEnd = targetNode.textSelectionEnd
+        val liveStart = targetNode.textSelectionStart
+        val liveEnd = targetNode.textSelectionEnd
 
-        val hasValidCursor = !isHint &&
-                selStart >= 0 &&
-                selEnd >= 0 &&
-                selStart <= existingText.length &&
-                selEnd <= existingText.length
+        val hasLiveCursor = !isHint &&
+                liveStart >= 0 &&
+                liveEnd >= 0 &&
+                liveStart <= existingText.length &&
+                liveEnd <= existingText.length
 
-        val startIdx = if (hasValidCursor) minOf(selStart, selEnd) else existingText.length
-        val endIdx = if (hasValidCursor) maxOf(selStart, selEnd) else existingText.length
+        val liveMin = if (hasLiveCursor) minOf(liveStart, liveEnd) else -1
+        val liveMax = if (hasLiveCursor) maxOf(liveStart, liveEnd) else -1
+
+        // If the user highlighted text before tapping the bubble, preserve that exact range even if
+        // tapping the overlay caused the app to drop the highlight visually.
+        val hasCapturedSelection = capturedSelStart >= 0 &&
+                capturedSelEnd > capturedSelStart &&
+                capturedSelEnd <= existingText.length
+
+        val startIdx: Int
+        val endIdx: Int
+
+        when {
+            replaceEntireField -> {
+                startIdx = 0
+                endIdx = existingText.length
+            }
+            liveMax > liveMin -> {
+                startIdx = liveMin
+                endIdx = liveMax
+            }
+            hasCapturedSelection -> {
+                startIdx = capturedSelStart
+                endIdx = capturedSelEnd
+            }
+            hasLiveCursor -> {
+                startIdx = liveMin
+                endIdx = liveMax
+            }
+            else -> {
+                startIdx = existingText.length
+                endIdx = existingText.length
+            }
+        }
 
         val before = existingText.substring(0, startIdx)
         val after = existingText.substring(endIdx)
 
-        val needsLeadingSpace = before.isNotEmpty() &&
+        val isReplacingSelection = endIdx > startIdx
+        val needsLeadingSpace = !isReplacingSelection &&
+                before.isNotEmpty() &&
                 !before.last().isWhitespace() &&
                 cleanText.firstOrNull() !in listOf('.', ',', '?', '!', ':', ';')
 
@@ -433,7 +519,6 @@ class VoiceFlowService : AccessibilityService() {
             }
             targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, cursorArgs)
         } else {
-            // Fallback: re-focus node, copy to clipboard, and paste
             targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val textToPaste = prefixSpace + cleanText
