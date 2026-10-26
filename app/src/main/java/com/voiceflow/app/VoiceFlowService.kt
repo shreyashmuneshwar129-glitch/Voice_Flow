@@ -12,6 +12,7 @@ import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -40,8 +41,10 @@ class VoiceFlowService : AccessibilityService() {
     private var audioRecorder: AudioWavRecorder? = null
     private var offlineSpeechHelper: OfflineSpeechHelper? = null
     private var isUsingOfflineMode = false
+    private var lastTapTimestamp = 0L
 
     private var lastFocusedEditableNode: AccessibilityNodeInfo? = null
+    private var recordingTargetNode: AccessibilityNodeInfo? = null
 
     // Snapshot for the 3-second Undo chip
     private var undoNode: AccessibilityNodeInfo? = null
@@ -68,6 +71,14 @@ class VoiceFlowService : AccessibilityService() {
         instance = this
         prefs = PrefsManager(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+        // Auto-upgrade if old restricted 2.5/2.0 model was saved earlier
+        if (prefs.selectedModel.startsWith("gemini-2.")) {
+            val better = prefs.availableModels
+                .sortedBy { GeminiClient.rankModel(it) }
+                .firstOrNull { !it.startsWith("gemini-2.") }
+            prefs.selectedModel = better ?: "gemini-3.8-flash"
+        }
 
         audioRecorder = AudioWavRecorder { amplitude ->
             mainHandler.post {
@@ -127,10 +138,6 @@ class VoiceFlowService : AccessibilityService() {
         }
     }
 
-    /**
-     * Checks if the soft keyboard (IME window) is currently open AND finds the focused editable field.
-     * Shows the bubble ONLY when the keyboard is open; hides it when the keyboard closes.
-     */
     private fun evaluateKeyboardVisibility() {
         if (!Settings.canDrawOverlays(this)) {
             hideBubble()
@@ -176,7 +183,6 @@ class VoiceFlowService : AccessibilityService() {
         if (imeWindowVisible) {
             showBubble()
         } else {
-            // Keep bubble visible only if user is actively recording or waiting for Gemini response
             val state = bubbleOverlay?.currentState ?: BubbleOverlayView.State.IDLE
             if (state == BubbleOverlayView.State.IDLE && undoPreviousText == null) {
                 hideBubble()
@@ -267,6 +273,11 @@ class VoiceFlowService : AccessibilityService() {
     }
 
     private fun handleBubbleTap() {
+        // Prevent accidental double-taps within 350ms
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTapTimestamp < 350L) return
+        lastTapTimestamp = now
+
         val view = bubbleOverlay ?: return
         when (view.currentState) {
             BubbleOverlayView.State.IDLE -> startDictation()
@@ -281,6 +292,9 @@ class VoiceFlowService : AccessibilityService() {
         mainHandler.removeCallbacks(hideChipRunnable)
         bubbleOverlay?.hideChip()
 
+        // Lock onto the current text field right when recording starts
+        recordingTargetNode = resolveActiveEditableNode()
+
         val hasMicPerm = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO
@@ -291,7 +305,6 @@ class VoiceFlowService : AccessibilityService() {
             return
         }
 
-        // Check internet connectivity for online vs offline fallback
         if (!isInternetAvailable()) {
             isUsingOfflineMode = true
             bubbleOverlay?.setState(BubbleOverlayView.State.LISTENING)
@@ -325,37 +338,32 @@ class VoiceFlowService : AccessibilityService() {
         bubbleOverlay?.setState(BubbleOverlayView.State.PROCESSING)
         val wavBytes = audioRecorder?.stopAndGetWavBytes() ?: ByteArray(0)
 
-        if (wavBytes.size <= 44) {
+        // Require at least ~0.2s of audio so accidental quick taps don't send empty audio
+        if (wavBytes.size < 6400) {
             bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
+            showTemporaryChip("Hold a moment longer while speaking.", isError = false, durationMs = 2200L)
             return
         }
 
         serviceScope.launch {
-            var modelToUse = prefs.selectedModel
-            if (modelToUse.isBlank()) {
-                val discovery = GeminiClient.fetchAndPickBestModel(prefs.apiKey)
-                if (discovery.success) {
-                    prefs.selectedModel = discovery.chosenModel
-                    prefs.availableModels = discovery.allModels
-                    modelToUse = discovery.chosenModel
-                } else {
-                    bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
-                    showTemporaryChip(discovery.errorMessage, isError = true, durationMs = 6000L)
-                    return@launch
-                }
-            }
-
             val result = GeminiClient.transcribeAndClean(
                 apiKey = prefs.apiKey,
-                modelName = modelToUse,
+                modelName = prefs.selectedModel,
+                availableModels = prefs.availableModels,
                 wavBytes = wavBytes
             )
 
             bubbleOverlay?.setState(BubbleOverlayView.State.IDLE)
 
             if (result.success) {
+                // Save the working model so future requests go straight to it on the first try
+                if (result.usedModel.isNotBlank() && result.usedModel != prefs.selectedModel) {
+                    prefs.selectedModel = result.usedModel
+                }
                 if (result.text.isNotBlank()) {
                     insertCleanedText(result.text, wasOffline = false)
+                } else {
+                    showTemporaryChip("Didn't catch any speech. Try speaking closer to the mic.", isError = false, durationMs = 2800L)
                 }
             } else {
                 showTemporaryChip(result.errorMessage, isError = true, durationMs = 6500L)
@@ -374,13 +382,8 @@ class VoiceFlowService : AccessibilityService() {
         }
     }
 
-    /**
-     * Inserts the cleaned text directly at the cursor in the focused text field
-     * (falling back to clipboard paste if ACTION_SET_TEXT is rejected by the app),
-     * and shows a 3-second "Undo" chip.
-     */
     private fun insertCleanedText(cleanText: String, wasOffline: Boolean) {
-        val targetNode = resolveActiveEditableNode()
+        val targetNode = resolveActiveEditableNode() ?: recordingTargetNode
         if (targetNode == null) {
             showTemporaryChip("Tap inside a text box first.", isError = true, durationMs = 3500L)
             return
@@ -421,7 +424,7 @@ class VoiceFlowService : AccessibilityService() {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText)
         }
 
-        val setSuccess = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
+        var setSuccess = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, setArgs)
 
         if (setSuccess) {
             val cursorArgs = Bundle().apply {
@@ -430,14 +433,14 @@ class VoiceFlowService : AccessibilityService() {
             }
             targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, cursorArgs)
         } else {
-            // Fallback to Clipboard + ACTION_PASTE
+            // Fallback: re-focus node, copy to clipboard, and paste
+            targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val textToPaste = prefixSpace + cleanText
             clipboard.setPrimaryClip(ClipData.newPlainText("VoiceFlow", textToPaste))
-            targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            setSuccess = targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         }
 
-        // Save snapshot for 3-second Undo
         undoNode = targetNode
         undoPreviousText = existingText
         undoPreviousCursor = startIdx
