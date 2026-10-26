@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VoiceFlow</string>
+    <string name="accessibility_service_label">VoiceFlow Dictation Assistant</string>
+    <string name="accessibility_service_description">Shows the VoiceFlow floating dictation bubble when your keyboard is open and inserts cleaned voice dictation directly into the focused text box. VoiceFlow never stores your dictated text or recordings.</string>
+</resources>
